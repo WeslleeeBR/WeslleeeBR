@@ -1,0 +1,234 @@
+// Beru — assistente pessoal.
+//
+// Postgres no Supabase. O app conecta pelo pooler (driver adapter em
+// src/lib/prisma.ts); a CLI usa DIRECT_URL (ver prisma.config.ts).
+//
+// Regra que atravessa o schema inteiro: TUDO é por usuário. Memória, conexão,
+// conversa e chave de API carregam `usuarioId` e são filtradas por ele em toda
+// consulta — não existe leitura "global" no app.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// De onde veio a memória. Serve para a UI distinguir o que o usuário escreveu
+/// do que o Beru gravou sozinho durante uma conversa.
+enum OrigemMemoria {
+  MANUAL
+  ASSISTENTE
+  IMPORTACAO
+}
+
+enum PapelMensagem {
+  USUARIO
+  ASSISTENTE
+  SISTEMA
+}
+
+model Usuario {
+  id           String    @id @default(cuid())
+  nome         String
+  username     String    @unique
+  email        String?   @unique
+  senhaHash    String
+  avatarUrl    String?
+  ativo        Boolean   @default(true)
+
+  /// Como o assistente trata o usuário: ["Senhor Weslle", "chefe"]. O Beru
+  /// alterna entre as formas para não soar robótico.
+  tratamentos  String[]  @default([])
+
+  /// Persona e aparência: { nome, corTema, persona, wakeWord, voz, modeloPreferido }.
+  /// Json para o usuário poder inventar campos novos na tela sem migration.
+  persona      Json?
+
+  ultimoLoginEm DateTime?
+  criadoEm      DateTime @default(now())
+  atualizadoEm  DateTime @updatedAt
+
+  areas      Area[]
+  memorias   Memoria[]
+  conexoes   Conexao[]
+  conversas  Conversa[]
+  chaves     ChaveIA[]
+
+  @@map("usuarios")
+}
+
+/// Área da vida (Metas, Carreira, Finanças...). É o agrupador que dá cor aos
+/// nós do grafo. Vem semeada com um conjunto padrão, mas o usuário pode
+/// renomear, recolorir e criar as próprias — por isso é tabela, não enum.
+model Area {
+  id        String  @id @default(cuid())
+  usuarioId String
+  /// Identificador estável usado pelo protocolo de memória do assistente
+  /// ("metas", "financas"...). O modelo devolve o slug, nunca o id.
+  slug      String
+  rotulo    String
+  cor       String  @default("#00d4ff")
+  ordem     Int     @default(0)
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  usuario  Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  memorias Memoria[]
+
+  @@unique([usuarioId, slug])
+  @@index([usuarioId])
+  @@map("areas")
+}
+
+/// Uma nota da "second brain". Cada uma vira um nó no grafo.
+model Memoria {
+  id        String  @id @default(cuid())
+  usuarioId String
+  areaId    String?
+
+  titulo String
+  /// Título normalizado (minúsculo, sem acento) — é a chave de deduplicação.
+  /// Sem ela, "Gestão Financeira" e "gestao financeira" viravam duas notas toda
+  /// vez que o modelo escrevia o título de um jeito levemente diferente.
+  chave  String
+  corpo  String
+
+  tags         String[]      @default([])
+  /// 1 a 5. Ordena o que entra no contexto quando a base cresce além do que
+  /// cabe no prompt, e define o raio do nó no grafo.
+  importancia  Int           @default(3)
+  /// Memória fixada entra no contexto sempre, independente de relevância.
+  fixada       Boolean       @default(false)
+  origem       OrigemMemoria @default(MANUAL)
+  /// Conversa em que o assistente gravou esta memória, quando foi ele.
+  origemConversaId String?
+
+  ultimoAcessoEm DateTime?
+  criadoEm       DateTime  @default(now())
+  atualizadoEm   DateTime  @updatedAt
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  area    Area?   @relation(fields: [areaId], references: [id], onDelete: SetNull)
+
+  saida   Conexao[] @relation("ConexaoOrigem")
+  entrada Conexao[] @relation("ConexaoDestino")
+
+  @@unique([usuarioId, chave])
+  @@index([usuarioId, areaId])
+  @@index([usuarioId, atualizadoEm])
+  @@map("memorias")
+}
+
+/// Aresta entre duas memórias — o que transforma a lista de notas numa rede.
+/// Tratamos como NÃO direcionada na tela; a direção guardada serve só para
+/// termos uma chave estável (origem, destino) e evitar aresta duplicada.
+model Conexao {
+  id        String @id @default(cuid())
+  usuarioId String
+  origemId  String
+  destinoId String
+
+  /// Rótulo livre da relação ("depende de", "financia"...). Opcional: o grafo
+  /// funciona sem rótulo nenhum.
+  tipo String?
+  /// 0..1 — espessura e opacidade da linha no grafo.
+  peso Float  @default(1)
+
+  criadaPeloAssistente Boolean @default(false)
+  criadoEm             DateTime @default(now())
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  origem  Memoria @relation("ConexaoOrigem", fields: [origemId], references: [id], onDelete: Cascade)
+  destino Memoria @relation("ConexaoDestino", fields: [destinoId], references: [id], onDelete: Cascade)
+
+  @@unique([origemId, destinoId])
+  @@index([usuarioId])
+  @@map("conexoes")
+}
+
+model Conversa {
+  id        String  @id @default(cuid())
+  usuarioId String
+  titulo    String  @default("Nova conversa")
+  arquivada Boolean @default(false)
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  usuario   Usuario    @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  mensagens Mensagem[]
+
+  @@index([usuarioId, atualizadoEm])
+  @@map("conversas")
+}
+
+model Mensagem {
+  id         String        @id @default(cuid())
+  conversaId String
+  papel      PapelMensagem
+  conteudo   String
+
+  /// Rastro de qual cérebro respondeu — necessário para diagnosticar "por que
+  /// essa resposta ficou ruim" quando há três provedores em rodízio.
+  provedor   String?
+  modelo     String?
+  latenciaMs Int?
+  /// Ids das memórias injetadas no prompt desta mensagem.
+  memoriasUsadas String[] @default([])
+
+  criadoEm DateTime @default(now())
+
+  conversa Conversa @relation(fields: [conversaId], references: [id], onDelete: Cascade)
+
+  @@index([conversaId, criadoEm])
+  @@map("mensagens")
+}
+
+/// Chave de API de um provedor de IA, cifrada em repouso (AES-256-GCM,
+/// src/lib/cripto.ts). O segredo NUNCA sai daqui: não existe endpoint que o
+/// devolva, e `final4` é o bastante para o usuário reconhecer qual é qual.
+model ChaveIA {
+  id        String @id @default(cuid())
+  usuarioId String
+
+  /// "gemini" | "groq" | "openrouter" — String, não enum: provedor novo não
+  /// pode exigir migration.
+  provedor       String
+  rotulo         String
+  segredoCifrado String
+  final4         String
+  /// Modelo preferido desta chave; vazio = padrão do provedor.
+  modelo         String?
+
+  /// Ordem de tentativa. A menor vai primeiro; se falhar, cai para a próxima.
+  prioridade Int     @default(0)
+  ativa      Boolean @default(true)
+
+  /// Última falha registrada, para a tela explicar por que uma chave parou de
+  /// ser usada (cota estourada, chave revogada...).
+  ultimoErro   String?
+  ultimoUsoEm  DateTime?
+  criadoEm     DateTime  @default(now())
+  atualizadoEm DateTime  @updatedAt
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId, prioridade])
+  @@map("chaves_ia")
+}
+
+/// Trilha de auditoria e também a base do rate limit de login (contamos
+/// LOGIN_FALHA recentes por IP e por usuário).
+model LogEvento {
+  id        String   @id @default(cuid())
+  tipo      String
+  usuarioId String?
+  detalhe   Json?
+  criadoEm  DateTime @default(now())
+
+  @@index([tipo, criadoEm])
+  @@map("log_eventos")
+}

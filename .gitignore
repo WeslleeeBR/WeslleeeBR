@@ -1,0 +1,23 @@
+node_modules/
+.env
+.env.local
+.env*.local
+
+# web
+web/.next/
+web/out/
+*.tsbuildinfo
+next-env.d.ts
+
+# app (Expo)
+app/.expo/
+app/dist/
+app/android/
+app/ios/
+app/*.apk
+app/*.aab
+
+.DS_Store
+
+# o app tem repositório próprio (padrão do Kronos: web e app separados)
+app/
